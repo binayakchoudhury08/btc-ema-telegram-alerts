@@ -1,0 +1,78 @@
+//@version=5
+// 9 EMA cross alerts on EMA High (blue) / EMA Low (red)  ->  webhook  ->  Telegram with chart photo
+// Uses TradingView's own data, so every alert matches your chart exactly.
+indicator("9 EMA Cross Alerts -> Telegram", overlay = true)
+
+fastLen   = input.int(9,  "Purple 9 EMA length")
+slowLen   = input.int(20, "EMA High / EMA Low length")
+chartBars = input.int(40, "Candles sent for the chart photo", minval = 10, maxval = 60)
+webKey    = input.string("CHANGE_ME", "Webhook key (same as WEBHOOK_KEY on the server)")
+
+fast = ta.ema(close, fastLen)
+emaH = ta.ema(high, slowLen)
+emaL = ta.ema(low, slowLen)
+
+plot(fast, "9 EMA",    color.purple, 2)
+plot(emaH, "EMA High", color.blue,   2)
+plot(emaL, "EMA Low",  color.red,    2)
+
+upH = ta.crossover(fast, emaH)
+dnH = ta.crossunder(fast, emaH)
+upL = ta.crossover(fast, emaL)
+dnL = ta.crossunder(fast, emaL)
+
+plotshape(upH, "Up through BLUE",   shape.triangleup,   location.belowbar, color.blue, size = size.small)
+plotshape(dnH, "Down through BLUE", shape.triangledown, location.abovebar, color.blue, size = size.small)
+plotshape(upL, "Up through RED",    shape.triangleup,   location.belowbar, color.red,  size = size.small)
+plotshape(dnL, "Down through RED",  shape.triangledown, location.abovebar, color.red,  size = size.small)
+
+// ---- keep the last N candles so the server can draw the chart photo ----
+var aO = array.new_float()
+var aH = array.new_float()
+var aL = array.new_float()
+var aC = array.new_float()
+var aF = array.new_float()
+var aB = array.new_float()
+var aR = array.new_float()
+
+push(a, v) =>
+    array.push(a, v)
+    if array.size(a) > chartBars
+        array.shift(a)
+    a
+
+push(aO, open)
+push(aH, high)
+push(aL, low)
+push(aC, close)
+push(aF, fast)
+push(aB, emaH)
+push(aR, emaL)
+
+join(a) =>
+    s = ""
+    for i = 0 to array.size(a) - 1
+        s := s + (i == 0 ? "" : ",") + str.tostring(array.get(a, i), "#.#")
+    "[" + s + "]"
+
+num(x) => str.tostring(x, "#.##")
+
+payload(lineName, dir) =>
+    "{\"key\":\"" + webKey + "\"" +
+     ",\"ticker\":\"" + syminfo.ticker + "\"" +
+     ",\"tf\":" + str.tostring(timeframe.in_seconds(), "#") +
+     ",\"t\":" + str.tostring(time, "#") +
+     ",\"line\":\"" + lineName + "\",\"dir\":\"" + dir + "\"" +
+     ",\"o\":" + num(open) + ",\"h\":" + num(high) + ",\"l\":" + num(low) + ",\"c\":" + num(close) +
+     ",\"fast\":" + num(fast) + ",\"blue\":" + num(emaH) + ",\"red\":" + num(emaL) +
+     ",\"bars\":{\"o\":" + join(aO) + ",\"h\":" + join(aH) + ",\"l\":" + join(aL) + ",\"c\":" + join(aC) +
+     ",\"fast\":" + join(aF) + ",\"blue\":" + join(aB) + ",\"red\":" + join(aR) + "}}"
+
+if upH
+    alert(payload("blue", "UPWARD"), alert.freq_once_per_bar_close)
+if dnH
+    alert(payload("blue", "DOWNWARD"), alert.freq_once_per_bar_close)
+if upL
+    alert(payload("red", "UPWARD"), alert.freq_once_per_bar_close)
+if dnL
+    alert(payload("red", "DOWNWARD"), alert.freq_once_per_bar_close)
