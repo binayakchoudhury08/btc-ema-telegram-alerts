@@ -1,15 +1,23 @@
 """
-TradingView webhook -> Telegram (chart photo + full message), running on Vercel.
+BTCUSD 30m  9 EMA cross alerts -> Telegram (chart photo + full message), on Vercel.
+
+Lines (same as the TradingView chart):
+  PURPLE = 9 EMA of close
+  BLUE   = 20 EMA of HIGH
+  RED    = 20 EMA of LOW
 
 Environment variables (Vercel -> Project -> Settings -> Environment Variables):
   TG_TOKEN     - bot token from @BotFather
-  TG_CHAT_IDS  - your Telegram chat id (several allowed, comma separated)
-  WEBHOOK_KEY  - the same secret word you typed in the Pine indicator
+  TG_CHAT_IDS  - Telegram chat id(s), comma separated
+  WEBHOOK_KEY  - your secret word (protects the URLs below)
+  FAST_LEN     - optional, purple EMA length (default 9)
+  SLOW_LEN     - optional, EMA High / EMA Low length (default 20)
 
 URLs:
-  POST /tv                     <- TradingView webhook
-  GET  /                       <- status page
+  GET  /cron?key=WEBHOOK_KEY   <- called by cron-job.org after every 30m candle close
   GET  /check?key=WEBHOOK_KEY  <- sends a "connected" message to Telegram
+  GET  /                       <- status page
+  POST /tv                     <- optional TradingView webhook (needs TradingView 2FA)
 """
 
 import os
@@ -32,6 +40,11 @@ from flask import Flask, request
 TG_TOKEN = os.environ.get("TG_TOKEN", "").strip()
 TG_CHAT_IDS = [c.strip() for c in os.environ.get("TG_CHAT_IDS", "").split(",") if c.strip()]
 WEBHOOK_KEY = os.environ.get("WEBHOOK_KEY", "").strip()
+FAST_LEN = int(os.environ.get("FAST_LEN", "9"))
+SLOW_LEN = int(os.environ.get("SLOW_LEN", "20"))
+TF_SEC = 1800          # 30-minute candles
+CHART_BARS = 40        # candles shown in the photo
+MAX_AGE_SEC = 600      # only alert on a candle that closed in the last 10 minutes
 
 IST = timezone(timedelta(hours=5, minutes=30))
 PURPLE, BLUE, RED = "#7B1FA2", "#1E40FF", "#E53935"
@@ -118,7 +131,7 @@ def make_chart(d):
     end = start + timedelta(seconds=tf_s)
     ax.set_title(
         f"{d.get('ticker', 'BTCUSD')} {tf_s // 60}m  |  9 EMA crossed {line.upper()} line {d['dir']}\n"
-        f"Candle {start:%d %b %Y %H:%M}-{end:%H:%M} IST  (TradingView data)",
+        f"Candle {start:%d %b %Y %H:%M}-{end:%H:%M} IST  ({d.get('source', 'TradingView')} data)",
         fontsize=13,
     )
     ax.legend(handles=[
@@ -169,7 +182,8 @@ def caption(d):
         f"9 EMA (purple): {float(d['fast']):,.2f}\n"
         f"EMA High (blue): {float(d['blue']):,.2f}\n"
         f"EMA Low (red): {float(d['red']):,.2f}\n\n"
-        f"Now: 9 EMA is {position(d)}\n\n"
+        f"Now: 9 EMA is {position(d)}\n"
+        f"Data: {d.get('source', 'TradingView')}\n\n"
         f"#BTCUSD #{d['line'].upper()}_{'UP' if up else 'DOWN'}"
     )
 
@@ -191,6 +205,100 @@ def handle_alert(d):
     tg("sendMessage", {"text": text, "parse_mode": "HTML"})  # never lose the alert
 
 
+# ------------------------- PRICE DATA (no TradingView needed) -------------------------
+def fetch_kraken():
+    r = requests.get("https://api.kraken.com/0/public/OHLC",
+                     params={"pair": "XBTUSD", "interval": TF_SEC // 60}, timeout=15)
+    data = r.json()
+    if data.get("error"):
+        raise RuntimeError(data["error"])
+    key = [k for k in data["result"] if k != "last"][0]
+    return "Kraken BTC/USD", [
+        (int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]))
+        for row in data["result"][key]
+    ]
+
+
+def fetch_bitstamp():
+    r = requests.get("https://www.bitstamp.net/api/v2/ohlc/btcusd/",
+                     params={"step": TF_SEC, "limit": 720}, timeout=15)
+    r.raise_for_status()
+    return "Bitstamp BTC/USD", [
+        (int(x["timestamp"]), float(x["open"]), float(x["high"]), float(x["low"]), float(x["close"]))
+        for x in r.json()["data"]["ohlc"]
+    ]
+
+
+def fetch_closed_candles():
+    now = time.time()
+    for source in (fetch_kraken, fetch_bitstamp):
+        try:
+            name, rows = source()
+            rows = sorted(r for r in rows if r[0] + TF_SEC <= now)  # closed candles only
+            if len(rows) > SLOW_LEN * 10:
+                return name, rows
+            log(f"{name}: not enough candles ({len(rows)})")
+        except Exception as e:
+            log(f"Data error from {source.__name__}: {e}")
+    raise RuntimeError("No price data from Kraken or Bitstamp")
+
+
+def ema(values, length):
+    """Same as TradingView ta.ema: starts with an SMA, then exponential smoothing."""
+    out = [None] * len(values)
+    if len(values) < length:
+        return out
+    k = 2 / (length + 1)
+    v = sum(values[:length]) / length
+    out[length - 1] = v
+    for i in range(length, len(values)):
+        v = values[i] * k + v * (1 - k)
+        out[i] = v
+    return out
+
+
+def run_scheduled_check():
+    source, rows = fetch_closed_candles()
+    t = [r[0] for r in rows]
+    o = [r[1] for r in rows]
+    h = [r[2] for r in rows]
+    l = [r[3] for r in rows]
+    c = [r[4] for r in rows]
+    fast, blue, red = ema(c, FAST_LEN), ema(h, SLOW_LEN), ema(l, SLOW_LEN)
+    i = len(rows) - 1
+
+    start = datetime.fromtimestamp(t[i], tz=IST)
+    status = (f"{source} | candle {start:%d %b %H:%M} IST | close {c[i]:,.2f} | "
+              f"9EMA {fast[i]:,.2f} | blue {blue[i]:,.2f} | red {red[i]:,.2f}")
+    log(status)
+
+    age = time.time() - (t[i] + TF_SEC)
+    if age > MAX_AGE_SEC:
+        return status + " | no alert (candle closed more than 10 min ago)"
+
+    sent = []
+    for line, arr in (("blue", blue), ("red", red)):
+        if fast[i - 1] <= arr[i - 1] and fast[i] > arr[i]:
+            direction = "UPWARD"
+        elif fast[i - 1] >= arr[i - 1] and fast[i] < arr[i]:
+            direction = "DOWNWARD"
+        else:
+            continue
+        a = max(0, len(rows) - CHART_BARS)
+        rnd = lambda xs: [round(x, 2) for x in xs[a:]]
+        handle_alert({
+            "source": source, "ticker": "BTCUSD", "tf": TF_SEC, "t": t[i] * 1000,
+            "line": line, "dir": direction,
+            "o": o[i], "h": h[i], "l": l[i], "c": c[i],
+            "fast": fast[i], "blue": blue[i], "red": red[i],
+            "bars": {"o": rnd(o), "h": rnd(h), "l": rnd(l), "c": rnd(c),
+                     "fast": rnd(fast), "blue": rnd(blue), "red": rnd(red)},
+        })
+        sent.append(f"{line.upper()} {direction}")
+
+    return status + (" | ALERT SENT: " + ", ".join(sent) if sent else " | no cross")
+
+
 # ----------------------------- ROUTES -----------------------------
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
 @app.route("/<path:path>", methods=["GET", "POST"])
@@ -207,6 +315,15 @@ def router(path):
             return "forbidden", 403
         handle_alert(d)
         return "ok", 200
+
+    if path.endswith("cron"):
+        if not WEBHOOK_KEY or request.args.get("key") != WEBHOOK_KEY:
+            return "Wrong or missing key", 403
+        try:
+            return run_scheduled_check(), 200
+        except Exception as e:
+            log(f"Scheduled check failed: {e}")
+            return f"error: {e}", 500
 
     if path.endswith("check"):
         if not WEBHOOK_KEY or request.args.get("key") != WEBHOOK_KEY:

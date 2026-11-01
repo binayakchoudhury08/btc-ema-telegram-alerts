@@ -21,10 +21,6 @@ dnH = ta.crossunder(fast, emaH)
 upL = ta.crossover(fast, emaL)
 dnL = ta.crossunder(fast, emaL)
 
-plotshape(upH, "Up through BLUE",   shape.triangleup,   location.belowbar, color.blue, size = size.small)
-plotshape(dnH, "Down through BLUE", shape.triangledown, location.abovebar, color.blue, size = size.small)
-plotshape(upL, "Up through RED",    shape.triangleup,   location.belowbar, color.red,  size = size.small)
-plotshape(dnL, "Down through RED",  shape.triangledown, location.abovebar, color.red,  size = size.small)
 
 // ---- keep the last N candles so the server can draw the chart photo ----
 var aO = array.new_float()
