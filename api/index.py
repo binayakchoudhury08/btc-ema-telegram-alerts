@@ -24,6 +24,9 @@ Environment variables (Vercel -> Settings -> Environment Variables):
 
 URLs:
   GET  /cron?key=WEBHOOK_KEY   <- called by cron-job.org every minute
+
+Price data: average of Coinbase, Kraken, Bitstamp and Bitfinex BTC/USD, rebuilt the
+same way TradingView builds CRYPTO:BTCUSD (arithmetic average of exchanges).
   GET  /check?key=WEBHOOK_KEY  <- sends a "connected" message to Telegram
   GET  /                       <- status page
   POST /tv                     <- optional TradingView webhook (needs TradingView 2FA)
@@ -274,9 +277,12 @@ def send_cancelled(source, line, direction, candle_start, seen_ts, close, fast, 
 
 
 # ============================== PRICE DATA ==============================
+HEADERS = {"User-Agent": "btc-ema-alert-bot/1.0"}
+
+
 def kraken(minutes):
     r = requests.get("https://api.kraken.com/0/public/OHLC",
-                     params={"pair": "XBTUSD", "interval": minutes}, timeout=12)
+                     params={"pair": "XBTUSD", "interval": minutes}, headers=HEADERS, timeout=10)
     data = r.json()
     if data.get("error"):
         raise RuntimeError(data["error"])
@@ -286,20 +292,83 @@ def kraken(minutes):
 
 def bitstamp(minutes):
     r = requests.get("https://www.bitstamp.net/api/v2/ohlc/btcusd/",
-                     params={"step": minutes * 60, "limit": 1000}, timeout=12)
+                     params={"step": minutes * 60, "limit": 1000}, headers=HEADERS, timeout=10)
     r.raise_for_status()
     return [(int(x["timestamp"]), float(x["open"]), float(x["high"]), float(x["low"]), float(x["close"]))
             for x in r.json()["data"]["ohlc"]]
 
 
+def bitfinex(minutes):
+    r = requests.get(f"https://api-pub.bitfinex.com/v2/candles/trade:{minutes}m:tBTCUSD/hist",
+                     params={"limit": 1000}, headers=HEADERS, timeout=10)
+    r.raise_for_status()
+    # [MTS, OPEN, CLOSE, HIGH, LOW, VOLUME]
+    return [(int(x[0]) // 1000, float(x[1]), float(x[3]), float(x[4]), float(x[2])) for x in r.json()]
+
+
+def coinbase(minutes):
+    # Coinbase has no 30m candles: build them from two 15m candles
+    gran = 60 if minutes == 1 else 900
+    r = requests.get("https://api.exchange.coinbase.com/products/BTC-USD/candles",
+                     params={"granularity": gran}, headers=HEADERS, timeout=10)
+    r.raise_for_status()
+    # [time, low, high, open, close, volume]
+    rows = sorted((int(x[0]), float(x[3]), float(x[2]), float(x[1]), float(x[4])) for x in r.json())
+    if minutes == 1:
+        return rows
+    buckets = {}
+    for t, o, h, l, c in rows:
+        buckets.setdefault(t // TF_SEC * TF_SEC, []).append((t, o, h, l, c))
+    out = []
+    for bt, parts in buckets.items():
+        if len(parts) != 2:
+            continue  # incomplete 30m bucket
+        parts.sort()
+        out.append((bt, parts[0][1], max(p[2] for p in parts), min(p[3] for p in parts), parts[1][4]))
+    return out
+
+
+EXCHANGES = {"Coinbase": coinbase, "Kraken": kraken, "Bitstamp": bitstamp, "Bitfinex": bitfinex}
+
+
+def average_rows(per_exchange):
+    """Average OHLC of all exchanges per candle time, like TradingView's CRYPTO:BTCUSD
+    (arithmetic average; an exchange whose price is far from the others is left out)."""
+    by_time = {}
+    for rows in per_exchange.values():
+        for r in rows:
+            by_time.setdefault(r[0], []).append(r)
+    out = []
+    for t in sorted(by_time):
+        rs = by_time[t]
+        closes = sorted(r[4] for r in rs)
+        med = closes[len(closes) // 2]
+        rs = [r for r in rs if abs(r[4] - med) / med < 0.01] or rs
+        n = len(rs)
+        out.append((t, sum(r[1] for r in rs) / n, sum(r[2] for r in rs) / n,
+                    sum(r[3] for r in rs) / n, sum(r[4] for r in rs) / n))
+    return out
+
+
 def fetch_all():
-    """30m candles + 1m candles from the SAME exchange (Kraken, Bitstamp as backup)."""
-    for name, fn in (("Kraken BTC/USD", kraken), ("Bitstamp BTC/USD", bitstamp)):
-        try:
-            return name, sorted(fn(30)), sorted(fn(1))
-        except Exception as e:
-            log(f"Data error from {name}: {e}")
-    raise RuntimeError("No price data from Kraken or Bitstamp")
+    """30m + 1m candles averaged over Coinbase, Kraken, Bitstamp and Bitfinex
+    (the main BTC/USD exchanges behind TradingView's CRYPTO:BTCUSD average)."""
+    from concurrent.futures import ThreadPoolExecutor
+    jobs = {(name, m): None for name in EXCHANGES for m in (30, 1)}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {key: pool.submit(EXCHANGES[key[0]], key[1]) for key in jobs}
+        for key, fut in futures.items():
+            try:
+                jobs[key] = fut.result()
+            except Exception as e:
+                log(f"Data error from {key[0]} ({key[1]}m): {e}")
+    ok = [name for name in EXCHANGES if jobs[(name, 30)] and jobs[(name, 1)]]
+    if not ok:
+        raise RuntimeError("No price data from any exchange")
+    label = f"Average of {', '.join(ok)}"
+    return (label,
+            average_rows({n: jobs[(n, 30)] for n in ok}),
+            average_rows({n: jobs[(n, 1)] for n in ok}))
 
 
 def ema(values, length):

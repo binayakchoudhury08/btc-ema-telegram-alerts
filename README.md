@@ -35,7 +35,8 @@ Tap any tag in Telegram to see every past signal of that kind:
 cron-job.org  (free scheduler)  ── calls your server EVERY MINUTE
         ▼
 Vercel server (api/index.py)
-   • gets BTC/USD 30m + 1m candles from Kraken (Bitstamp as backup)
+   • gets BTC/USD 30m + 1m candles from Coinbase, Kraken, Bitstamp, Bitfinex
+   • averages them, the same way TradingView builds CRYPTO:BTCUSD
    • calculates 9 EMA (close), 20 EMA (high), 20 EMA (low), like TradingView
    • candle open   → checks the LIVE lines → EARLY SIGNAL
    • candle closed → checks the final lines → CONFIRMED or CANCELLED
@@ -55,12 +56,16 @@ btc-ema-telegram-alerts/
 └── README.md                            this file
 ```
 
-## Accuracy note
+## Accuracy note (CRYPTO:BTCUSD)
 
-Prices come from Kraken BTC/USD. TradingView's CRYPTO:BTCUSD is TradingView's own
-index from several exchanges, so values differ by a few dollars. Almost every
-cross lands on the same candle as on your chart. On a very tight cross the
-alert can be one candle off, or rarely missing. Every message says its data source.
+TradingView builds CRYPTO:BTCUSD as an average of BTC prices from several exchanges.
+The bot rebuilds it the same way, from the main USD exchanges: Coinbase, Kraken,
+Bitstamp and Bitfinex. If one exchange is down or its price is far off, it's left
+out, like TradingView does. Every message shows which exchanges were used.
+
+TradingView doesn't publish its exact exchange list, so the values can still differ
+by a few dollars from your chart. Clear crosses land on the same candle; a very
+tight cross can rarely be one candle off.
 
 The bot reports crosses. It doesn't place trades, and a cross alone isn't a
 guaranteed buy or sell signal.

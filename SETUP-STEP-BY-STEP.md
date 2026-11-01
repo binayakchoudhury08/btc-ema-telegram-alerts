@@ -144,7 +144,7 @@ https://YOUR-DOMAIN/cron?key=YOUR-KEY
 
 **You should see** one line like this, with today's real numbers:
 ```
-Kraken BTC/USD | LIVE candle 01 Nov 13:00 IST, minute 17 | price 77,780.10 | 9EMA 77,701.55 | blue 77,690.20 | red 77,520.90 | no new cross
+Average of Coinbase, Kraken, Bitstamp, Bitfinex | LIVE candle 01 Nov 13:00 IST, minute 17 | price 77,780.10 | 9EMA 77,701.55 | blue 77,690.20 | red 77,520.90 | no new cross
 ```
 
 - "LIVE candle ..., minute 17" means the 13:00 candle is open and 17 minutes are finished.
@@ -208,7 +208,7 @@ with the next run time within the next minute.
 
 **You should see:** status **Successful** (200), and a response like:
 ```
-Kraken BTC/USD | LIVE candle ... minute 12 | price ... | 9EMA ... | blue ... | red ... | no new cross
+Average of Coinbase, Kraken, Bitstamp, Bitfinex | LIVE candle ... minute 12 | price ... | 9EMA ... | blue ... | red ... | no new cross
 ```
 At the first minute after each candle closes (xx:00 or xx:30), the response says
 `CLOSE CHECK candle ...`.
