@@ -3,8 +3,9 @@
 Telegram alerts when the **purple 9 EMA** crosses the **blue EMA High** or the
 **red EMA Low** on **BTCUSD 30-minute** candles, upward or downward.
 
-**No TradingView alerts, no webhooks, no 2-factor authentication.**
-Your shared TradingView account isn't touched.
+**Exact CRYPTO:BTCUSD numbers:** TradingView detects the cross on its own data and
+sends the alert by **email** (no webhook, so no 2-factor authentication needed).
+A free Google script forwards the email to the server, which posts to Telegram.
 
 👉 **Setup instructions: open `SETUP-STEP-BY-STEP.md`**
 
@@ -12,36 +13,44 @@ Your shared TradingView account isn't touched.
 
 | Stage | When | What you get |
 |---|---|---|
-| ⚠️ **EARLY SIGNAL** | Within ~1 minute of the live 9 EMA crossing a line, while the 30m candle is still open | Message + chart photo, marked "not confirmed yet" |
-| ✅ **CONFIRMED** | 1 minute after the candle closes, if the cross is still there | Full message + chart photo |
-| ❌ **CANCELLED** | 1 minute after the candle closes, if the 9 EMA moved back before the close | Short message: the early signal didn't hold |
+| 🟡 **LINES TOUCHING** | Usually under 1 minute after the live 9 EMA touches the blue or red line (within the Touch distance), while the 30m candle is still open | Message + chart photo |
+| ✅ **CONFIRMED** | Usually under 1 minute after the candle closes, if the 9 EMA has crossed the line | Full message + chart photo |
+| ❌ **CANCELLED** | Usually under 1 minute after the candle closes, if it touched but didn't cross | Short message |
 
-- Every early signal is always followed by either **CONFIRMED** or **CANCELLED**.
-- A cross that only happens in the very last minute of a candle comes straight as
-  **CONFIRMED** (the message says "Early signal: none").
-- One early signal per line per candle. If the price wobbles back and forth, you
-  aren't spammed.
+- Every touch alert is followed by either **CONFIRMED** or **CANCELLED**.
+- One touch alert per line per candle, and only for a new touch.
+- "Touch distance" (default 25 USD) is set in the indicator's Inputs.
+
+## Price level alerts (up to 3 levels)
+
+| Alert | What you get |
+|---|---|
+| 🎯 **PRICE LEVEL CROSSED** | Price crossed your level: direction, time (to the second), chart with the level line |
+| ↩️ **PRICE CAME BACK** | Price came back through the level: cross time, back time, how long it stayed past it |
+
+## Timeframe
+
+Alerts use the timeframe of the chart the alert is created on (5m, 15m, 30m, 1h, 4h...).
+To change it: switch the chart timeframe, then delete and recreate the alert.
 
 ## Telegram tags (your signal history)
 
 Tap any tag in Telegram to see every past signal of that kind:
 
-- Stage: `#EARLY` `#CONFIRMED` `#CANCELLED`
+- Stage: `#TOUCH` `#CONFIRMED` `#CANCELLED` `#LEVEL_CROSS` `#LEVEL_BACK`
+- A level: e.g. `#LEVEL_78000`
 - Line and direction: `#BLUE_UP` `#BLUE_DOWN` `#RED_UP` `#RED_DOWN`
 
 ## How it works
 
 ```
-cron-job.org  (free scheduler)  ── calls your server EVERY MINUTE
+TradingView CRYPTO:BTCUSD 30m chart + indicator  ── alert by EMAIL
         ▼
-Vercel server (api/index.py)
-   • gets BTC/USD 30m + 1m candles from Coinbase, Kraken, Bitstamp, Bitfinex
-   • averages them, the same way TradingView builds CRYPTO:BTCUSD
-   • calculates 9 EMA (close), 20 EMA (high), 20 EMA (low), like TradingView
-   • candle open   → checks the LIVE lines → EARLY SIGNAL
-   • candle closed → checks the final lines → CONFIRMED or CANCELLED
+Gmail + Google Apps Script (checks every minute)  ── forwards to
         ▼
-Telegram ──► your iPhone + Samsung (same Telegram account)
+Vercel server (api/index.py)  ── draws the chart from TradingView's numbers
+        ▼
+Telegram ──► your iPhone + Samsung
 ```
 
 ## Folder contents
@@ -51,21 +60,17 @@ btc-ema-telegram-alerts/
 ├── api/index.py                         the server
 ├── requirements.txt                     Python packages for Vercel
 ├── vercel.json                          Vercel routing + timeout settings
-├── tradingview/ema_cross_telegram.pine  OPTIONAL: draws the same 3 lines on TradingView
+├── tradingview/ema_cross_telegram.pine  TradingView indicator that fires the alerts
+├── gmail_script/forward_tradingview_alerts.gs  Google script: Gmail → server
 ├── SETUP-STEP-BY-STEP.md                full click-by-click setup
 └── README.md                            this file
 ```
 
-## Accuracy note (CRYPTO:BTCUSD)
+## Accuracy
 
-TradingView builds CRYPTO:BTCUSD as an average of BTC prices from several exchanges.
-The bot rebuilds it the same way, from the main USD exchanges: Coinbase, Kraken,
-Bitstamp and Bitfinex. If one exchange is down or its price is far off, it's left
-out, like TradingView does. Every message shows which exchanges were used.
-
-TradingView doesn't publish its exact exchange list, so the values can still differ
-by a few dollars from your chart. Clear crosses land on the same candle; a very
-tight cross can rarely be one candle off.
+All values come from TradingView's own CRYPTO:BTCUSD calculation, so the messages
+match your chart exactly. (The `/cron` exchange-price check still exists in the
+server as a backup, but it isn't used; its cron-job.org job is switched off.)
 
 The bot reports crosses. It doesn't place trades, and a cross alone isn't a
 guaranteed buy or sell signal.

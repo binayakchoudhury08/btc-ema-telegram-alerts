@@ -29,13 +29,16 @@ Price data: average of Coinbase, Kraken, Bitstamp and Bitfinex BTC/USD, rebuilt 
 same way TradingView builds CRYPTO:BTCUSD (arithmetic average of exchanges).
   GET  /check?key=WEBHOOK_KEY  <- sends a "connected" message to Telegram
   GET  /                       <- status page
-  POST /tv                     <- optional TradingView webhook (needs TradingView 2FA)
+  POST /tv                     <- TradingView alerts (forwarded from Gmail by the
+                                  Google Apps Script, or a TradingView webhook)
 """
 
 import os
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")  # Vercel: only /tmp is writable
 
 import io
+import re
+import html
 import json
 import time
 import logging
@@ -74,6 +77,28 @@ def ist(ts):
 
 def sgn(x):
     return 1 if x > 0 else -1 if x < 0 else 0
+
+
+def tf_label(tf_s):
+    tf_s = int(tf_s)
+    if tf_s % 86400 == 0:
+        return f"{tf_s // 86400}D"
+    if tf_s % 3600 == 0:
+        return f"{tf_s // 3600}h"
+    return f"{tf_s // 60}m"
+
+
+def hms(ms):
+    return f"{ist(int(ms) / 1000):%d %b %H:%M:%S}"
+
+
+def duration(sec):
+    sec = int(sec)
+    d, sec = divmod(sec, 86400)
+    h, sec = divmod(sec, 3600)
+    m, sec = divmod(sec, 60)
+    parts = ([f"{d}d"] if d else []) + ([f"{h}h"] if h else []) + ([f"{m}m"] if m else []) + [f"{sec}s"]
+    return " ".join(parts)
 
 
 def tag(line, direction):
@@ -116,10 +141,17 @@ def make_chart(d):
     o[-1], h[-1], l[-1], c[-1] = float(d["o"]), float(d["h"]), float(d["l"]), float(d["c"])
     fast[-1], blue[-1], red[-1] = float(d["fast"]), float(d["blue"]), float(d["red"])
 
-    early = d.get("stage") == "EARLY"
-    line, up = d["line"], d["dir"] == "UPWARD"
-    color = LINE_COLOR[line]
-    y = float(d[line])
+    stage = d.get("stage", "CONFIRMED")
+    level_mode = stage.startswith("LEVEL")
+    early = stage in ("EARLY", "TOUCH") or level_mode
+    touch = stage == "TOUCH"
+    up = d["dir"] == "UPWARD"
+    if level_mode:
+        line, color, y = "level", "#F57C00", float(d["level"])
+    else:
+        line = d["line"]
+        color = LINE_COLOR[line]
+        y = float(d[line])
 
     fig, ax = plt.subplots(figsize=(14, 8))
     rng_all = max(h) - min(l)
@@ -140,8 +172,10 @@ def make_chart(d):
     ax.axvline(n - 1, color=color, linestyle="--", linewidth=1, alpha=0.6, zorder=1)
     ax.scatter([n - 1], [y], s=350, color=color, marker="^" if up else "v", zorder=6)
 
-    lo_y = min(min(l), min(red), min(fast))
-    hi_y = max(max(h), max(blue), max(fast))
+    if level_mode:
+        ax.axhline(y, color=color, linestyle="--", linewidth=1.6, zorder=4)
+    lo_y = min(min(l), min(red), min(fast), y)
+    hi_y = max(max(h), max(blue), max(fast), y)
     pad = (hi_y - lo_y) * 0.08
     ax.set_ylim(lo_y - pad, hi_y + pad)
     ax.set_xlim(-1, n + 1)
@@ -157,24 +191,37 @@ def make_chart(d):
 
     start = times[-1]
     end = start + timedelta(seconds=tf_s)
-    stage_txt = "EARLY SIGNAL (candle still open)" if early else "CONFIRMED (candle closed)"
+    if level_mode:
+        stage_txt = (f"PRICE LEVEL {y:,.2f} CROSSED {d['dir']}" if stage == "LEVEL_CROSS"
+                     else f"PRICE BACK THROUGH LEVEL {y:,.2f} ({d['dir']})")
+    elif touch:
+        stage_txt = f"LINES TOUCHING (candle still open)  |  9 EMA touching {line.upper()}, possible {d['dir']} cross"
+    elif early:
+        stage_txt = f"EARLY SIGNAL (candle still open)  |  9 EMA crossed {line.upper()} {d['dir']}"
+    else:
+        stage_txt = f"CONFIRMED (candle closed)  |  9 EMA crossed {line.upper()} {d['dir']}"
     ax.set_title(
-        f"{d.get('ticker', 'BTCUSD')} {tf_s // 60}m  |  {stage_txt}  |  9 EMA crossed {line.upper()} {d['dir']}\n"
+        f"{d.get('ticker', 'BTCUSD')} {tf_label(tf_s)}  |  {stage_txt}\n"
         f"Candle {start:%d %b %Y %H:%M}-{end:%H:%M} IST  |  {d.get('source', 'TradingView')} data",
         fontsize=13,
     )
-    ax.legend(handles=[
+    handles = [
         Line2D([], [], color=PURPLE, lw=2, label=f"9 EMA (purple)  {float(d['fast']):,.2f}"),
         Line2D([], [], color=BLUE, lw=2, label=f"EMA High (blue)  {float(d['blue']):,.2f}"),
         Line2D([], [], color=RED, lw=2, label=f"EMA Low (red)  {float(d['red']):,.2f}"),
-    ], loc="upper left", fontsize=10, framealpha=0.9)
+    ]
+    if level_mode:
+        handles.insert(0, Line2D([], [], color=color, lw=2, ls="--", label=f"Level  {y:,.2f}"))
+        handles.insert(1, Line2D([], [], color="black", lw=0, label=f"Price now  {float(d['c']):,.2f}"))
+    ax.legend(handles=handles, loc="upper left", fontsize=10, framealpha=0.9)
 
     ylo, yhi = ax.get_ylim()
     ty = y + (0.18 if up else -0.18) * (yhi - ylo)
     ty = min(max(ty, ylo + 0.12 * (yhi - ylo)), yhi - 0.12 * (yhi - ylo))
-    label_time = d.get("seen") or f"{start:%H:%M}"
+    label_time = (f"{ist(int(d['seen']) / 1000):%H:%M:%S}" if level_mode
+                  else d.get("seen") or f"{start:%H:%M}")
     ax.annotate(
-        f"{'EARLY CROSS' if early else 'CROSS'} {d['dir']}\n{label_time} IST\n{y:,.2f}",
+        f"{'LEVEL' if level_mode else 'TOUCH' if touch else 'EARLY CROSS' if early else 'CROSS'} {d['dir']}\n{label_time} IST\n{y:,.2f}",
         xy=(n - 1, y), xytext=(max(0, n - 12), ty),
         arrowprops=dict(arrowstyle="->", color=color, lw=1.8),
         fontsize=10, color=color, fontweight="bold",
@@ -203,7 +250,7 @@ def caption_early(d):
     up = d["dir"] == "UPWARD"
     return (
         f"⚠️ <b>EARLY SIGNAL — not confirmed yet</b>\n"
-        f"<b>{d.get('ticker', 'BTCUSD')} {int(d['tf']) // 60}m</b>\n\n"
+        f"<b>{d.get('ticker', 'BTCUSD')} {tf_label(d['tf'])}</b>\n\n"
         f"<b>9 EMA (purple) is crossing the {LINE_NAME[d['line']]}</b>\n"
         f"Direction: <b>{d['dir']}</b> {'⬆️' if up else '⬇️'}\n"
         f"Seen at: {d['seen']} IST\n"
@@ -219,13 +266,71 @@ def caption_early(d):
     )
 
 
+def caption_touch(d):
+    start = ist(int(d["t"]) // 1000)
+    end = start + timedelta(seconds=int(d["tf"]))
+    up = d["dir"] == "UPWARD"
+    f, v = float(d["fast"]), float(d[d["line"]])
+    crossed_live = (f > v) if up else (f < v)
+    state = (f"Already crossed {d['dir']} (live, not final)" if crossed_live
+             else f"Coming from {'BELOW' if up else 'ABOVE'}, possible {d['dir']} cross")
+    return (
+        f"🟡 <b>LINES TOUCHING — watch now</b>\n"
+        f"<b>{d.get('ticker', 'BTCUSD')} {tf_label(d['tf'])}</b>\n\n"
+        f"<b>9 EMA (purple) is touching the {LINE_NAME[d['line']]}</b>\n"
+        f"{state} {'⬆️' if up else '⬇️'}\n"
+        f"Gap now: {abs(f - v):,.2f}\n"
+        f"Seen at: {d['seen']} IST\n"
+        f"Candle: {start:%d %b %Y}, {start:%H:%M}–{end:%H:%M} IST (still open)\n\n"
+        f"Price now: {float(d['c']):,.2f}\n"
+        f"Candle so far: O {float(d['o']):,.2f} | H {float(d['h']):,.2f} | L {float(d['l']):,.2f}\n\n"
+        f"9 EMA (live): {f:,.2f}\n"
+        f"EMA High (live): {float(d['blue']):,.2f}\n"
+        f"EMA Low (live): {float(d['red']):,.2f}\n\n"
+        f"⏳ At the {end:%H:%M} IST candle close you get ✅ CONFIRMED (crossed) or ❌ CANCELLED (no cross).\n"
+        f"Data: {d.get('source', 'TradingView')}\n\n"
+        f"#BTCUSD #TOUCH {tag(d['line'], d['dir'])}"
+    )
+
+
+def caption_level(d):
+    lvl = float(d["level"])
+    up = d["dir"] == "UPWARD"
+    head = f"<b>{d.get('ticker', 'BTCUSD')} {tf_label(d['tf'])}</b>"
+    lvl_tag = f"#LEVEL_{int(round(lvl))}"
+    if d["stage"] == "LEVEL_CROSS":
+        return (
+            f"🎯 <b>PRICE LEVEL CROSSED</b>\n{head}\n\n"
+            f"Price crossed <b>{lvl:,.2f}</b> <b>{d['dir']}</b> {'⬆️' if up else '⬇️'}\n"
+            f"Time: {hms(d['seen'])} IST\n"
+            f"Price now: {float(d['c']):,.2f}\n\n"
+            f"9 EMA: {float(d['fast']):,.2f} | EMA High: {float(d['blue']):,.2f} | EMA Low: {float(d['red']):,.2f}\n\n"
+            f"You'll get another message if the price comes back through {lvl:,.2f}.\n"
+            f"Data: {d.get('source', 'TradingView')}\n\n"
+            f"#BTCUSD #LEVEL_CROSS {lvl_tag}"
+        )
+    crossed = int(float(d.get("crossed") or 0))
+    stayed = duration((int(d["seen"]) - crossed) / 1000) if crossed else "unknown"
+    first_dir = "UPWARD" if not up else "DOWNWARD"
+    return (
+        f"↩️ <b>PRICE CAME BACK THROUGH LEVEL</b>\n{head}\n\n"
+        f"Level: <b>{lvl:,.2f}</b>\n"
+        f"Crossed {first_dir} at: {hms(crossed) if crossed else 'unknown'} IST\n"
+        f"Came back {'above' if up else 'below'} at: {hms(d['seen'])} IST {'⬆️' if up else '⬇️'}\n"
+        f"Time past the level: <b>{stayed}</b>\n"
+        f"Price now: {float(d['c']):,.2f}\n\n"
+        f"Data: {d.get('source', 'TradingView')}\n\n"
+        f"#BTCUSD #LEVEL_BACK {lvl_tag}"
+    )
+
+
 def caption_confirmed(d):
     start = ist(int(d["t"]) // 1000)
     end = start + timedelta(seconds=int(d["tf"]))
     up = d["dir"] == "UPWARD"
-    early_line = f"Early signal: {d['early_info']}\n" if d.get("early_info") else ""
+    early_line = f"{d.get('early_label', 'Early signal')}: {d['early_info']}\n" if d.get("early_info") else ""
     return (
-        f"✅ <b>CONFIRMED — {d.get('ticker', 'BTCUSD')} {int(d['tf']) // 60}m 9 EMA CROSS</b>\n\n"
+        f"✅ <b>CONFIRMED — {d.get('ticker', 'BTCUSD')} {tf_label(d['tf'])} 9 EMA CROSS</b>\n\n"
         f"<b>9 EMA (purple) has cut the {LINE_NAME[d['line']]}</b>\n"
         f"Direction: <b>{d['dir']}</b> {'⬆️' if up else '⬇️'} (9 EMA moved {'above' if up else 'below'} it)\n"
         f"Candle: {start:%d %b %Y}, {start:%H:%M}–{end:%H:%M} IST (closed)\n"
@@ -243,13 +348,16 @@ def caption_confirmed(d):
 
 def handle_alert(d):
     stage = d.get("stage", "CONFIRMED")
-    key = (d.get("t"), d.get("line"), d.get("dir"), stage)
+    key = (d.get("t"), d.get("line"), d.get("dir"), stage, d.get("seen") if stage.startswith("LEVEL") else 0,
+           d.get("level"))
     if key in _seen:
         log(f"Duplicate ignored: {key}")
         return
     _seen.add(key)
     log(f"{stage}: {d['line']} {d['dir']} candle {d['t']}")
-    text = caption_early(d) if stage == "EARLY" else caption_confirmed(d)
+    text = (caption_level(d) if stage.startswith("LEVEL") else
+            caption_touch(d) if stage == "TOUCH" else
+            caption_early(d) if stage == "EARLY" else caption_confirmed(d))
     try:
         if tg("sendPhoto", {"caption": text, "parse_mode": "HTML"}, make_chart(d)):
             return
@@ -258,13 +366,17 @@ def handle_alert(d):
     tg("sendMessage", {"text": text, "parse_mode": "HTML"})  # never lose the alert
 
 
-def send_cancelled(source, line, direction, candle_start, seen_ts, close, fast, line_val):
-    end = ist(candle_start + TF_SEC)
+def send_cancelled(source, line, direction, candle_start, seen_ts, close, fast, line_val, touch=False,
+                   tf=TF_SEC, ticker="BTCUSD"):
+    end = ist(candle_start + int(tf))
+    what = (f"The 9 EMA touched the {LINE_NAME[line]} at {ist(seen_ts):%H:%M} IST,\n"
+            f"but did not cross it <b>{direction}</b> by the {end:%H:%M} IST candle close.\n" if touch else
+            f"The 9 EMA crossed the {LINE_NAME[line]} <b>{direction}</b> at {ist(seen_ts):%H:%M} IST,\n"
+            f"but moved back before the {end:%H:%M} IST candle close.\n")
     text = (
-        f"❌ <b>CANCELLED — early signal not confirmed</b>\n"
-        f"<b>BTCUSD 30m</b>\n\n"
-        f"The 9 EMA crossed the {LINE_NAME[line]} <b>{direction}</b> at {ist(seen_ts):%H:%M} IST,\n"
-        f"but moved back before the {end:%H:%M} IST candle close.\n"
+        f"❌ <b>CANCELLED — {'touch did not become a cross' if touch else 'early signal not confirmed'}</b>\n"
+        f"<b>{ticker} {tf_label(tf)}</b>\n\n"
+        f"{what}"
         f"No cross on this candle.\n\n"
         f"Close: {close:,.2f}\n"
         f"9 EMA (purple): {fast:,.2f}\n"
@@ -508,22 +620,65 @@ def run_scheduled_check(now=None):
     return status + (" | " + ", ".join(out) if out else " | no new cross")
 
 
+# ===================== TRADINGVIEW ALERTS (exact CRYPTO:BTCUSD) =====================
+def parse_payload(raw):
+    raw = html.unescape(raw or "")
+    a, b = raw.find("{"), raw.rfind("}")
+    if a < 0 or b <= a:
+        raise ValueError("no JSON found")
+    return json.loads(re.sub(r"\s+", "", raw[a:b + 1]))
+
+
+def handle_tradingview(d):
+    d["source"] = str(d.get("source", "TradingView")).replace("TradingView-", "TradingView ", 1)
+    stage = str(d.get("stage", "CONFIRMED")).upper()
+    seen_ms = int(float(d.get("seen") or 0))
+    t_s = int(d["t"]) // 1000
+    if stage in ("LEVEL_CROSS", "LEVEL_BACK"):
+        d["stage"] = stage
+        d["seen"] = seen_ms or int(d["t"])
+        handle_alert(d)
+    elif stage in ("EARLY", "TOUCH"):
+        d["stage"] = stage
+        d["seen"] = f"{ist(seen_ms // 1000 if seen_ms else t_s):%H:%M}"
+        handle_alert(d)
+    elif stage == "CANCELLED":
+        key = (d.get("t"), d.get("line"), d.get("dir"), "CANCELLED")
+        if key in _seen:
+            return
+        _seen.add(key)
+        send_cancelled(d["source"], d["line"], d["dir"], t_s,
+                       seen_ms // 1000 if seen_ms else t_s,
+                       float(d["c"]), float(d["fast"]), float(d[d["line"]]), touch=True,
+                       tf=int(d["tf"]), ticker=d.get("ticker", "BTCUSD"))
+    else:
+        d["stage"] = "CONFIRMED"
+        d["early_label"] = "Touch alert"
+        d["early_info"] = (f"sent at {ist(seen_ms // 1000):%H:%M} IST" if seen_ms
+                           else "none this candle (lines were already touching, or crossed in the last moment)")
+        handle_alert(d)
+
+
 # ================================ ROUTES ================================
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
 @app.route("/<path:path>", methods=["GET", "POST"])
 def router(path):
     path = path.strip("/")
 
-    if request.method == "POST":  # optional TradingView webhook
+    if request.method == "POST":  # TradingView alert (via Gmail script or webhook)
         try:
-            d = json.loads(request.get_data(as_text=True))
-        except Exception:
+            d = parse_payload(request.get_data(as_text=True))
+        except Exception as e:
+            log(f"Bad alert payload: {e}")
             return "bad json", 400
         if not WEBHOOK_KEY or d.get("key") != WEBHOOK_KEY:
-            log("Rejected: wrong webhook key")
+            log("Rejected: wrong key")
             return "forbidden", 403
-        d.setdefault("stage", "CONFIRMED")
-        handle_alert(d)
+        try:
+            handle_tradingview(d)
+        except Exception as e:
+            log(f"Alert handling failed: {e}")
+            return f"error: {e}", 500
         return "ok", 200
 
     if path.endswith("cron"):
